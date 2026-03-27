@@ -183,6 +183,12 @@ public final class KokoroTTS {
 
     // Initialize G2P processor for text-to-phoneme conversion
     g2pProcessor = try? G2PFactory.createG2PProcessor(engine: g2p)
+
+    // Set a conservative Metal buffer cache limit to prevent unbounded growth.
+    // MLX's default cache limit allows caching up to the recommended working set
+    // size (tens of GB on Apple Silicon), which causes severe memory pressure
+    // during sequential synthesis. 32 MB is generous for buffer reuse.
+    Memory.cacheLimit = 32 * 1024 * 1024
   }
   
   /// Generates audio from text using the specified voice and parameters.
@@ -260,7 +266,17 @@ public final class KokoroTTS {
     // Stop performance timing
     BenchmarkTimer.stopTimer(Constants.bm_TTS)
 
-    return (audio[0].asArray(Float.self), tokenArray)
+    let result = audio[0].asArray(Float.self)
+
+    // Clear the Metal buffer cache to prevent unbounded IOAccelerator growth.
+    // Each generateAudio() call creates ~1.7 GB of cached Metal buffers that
+    // are never automatically freed. Without this, sequential synthesis (e.g.,
+    // streaming sentence-by-sentence) accumulates tens of GB in swap.
+    // This MUST happen inside the dylib to operate on the correct Metal device
+    // singleton -- calling from the host binary clears a separate empty cache.
+    Memory.clearCache()
+
+    return (result, tokenArray)
   }
   
   /// Updates the G2P language if it differs from the current language.
