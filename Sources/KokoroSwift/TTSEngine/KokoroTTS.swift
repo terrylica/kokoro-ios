@@ -59,6 +59,42 @@ public final class KokoroTTS {
   /// Currently active language (cached to avoid reinitializing G2P)
   private var chosenLanguage: Language = .none
   
+  // MARK: - Metal Buffer Cache Management
+
+  /// Clear the MLX Metal buffer cache to reclaim GPU memory.
+  ///
+  /// MLX caches Metal buffers from previous computations for reuse. During
+  /// sequential TTS synthesis (e.g., streaming sentence-by-sentence), this
+  /// cache grows ~1.7 GB per generateAudio() call and is never automatically
+  /// freed. Call this after each generateAudio() to prevent unbounded growth.
+  ///
+  /// This method MUST be called from within KokoroSwift's dylib context to
+  /// operate on the correct Metal device singleton. Calling Memory.clearCache()
+  /// directly from the host binary will clear a separate, empty cache.
+  public func clearCache() {
+    Memory.clearCache()
+  }
+
+  /// Set the MLX Metal buffer cache limit to cap memory growth.
+  ///
+  /// When the cache exceeds this limit, older buffers are freed on the next
+  /// allocation. A small limit (e.g., 32 MB) prevents unbounded growth while
+  /// still allowing buffer reuse for inference.
+  ///
+  /// Returns the previous cache limit.
+  @discardableResult
+  public func setCacheLimit(_ limit: Int) -> Int {
+    let previous = Memory.cacheLimit
+    Memory.cacheLimit = limit
+    return previous
+  }
+
+  /// Get current MLX memory statistics (active, cache, peak) in bytes.
+  public func memorySnapshot() -> (active: Int, cache: Int, peak: Int) {
+    let snap = Memory.snapshot()
+    return (snap.activeMemory, snap.cacheMemory, snap.peakMemory)
+  }
+
   /// Initializes the Kokoro TTS engine with model weights and G2P processor.
   /// - Parameters:
   ///   - modelPath: URL to the directory containing model weights
