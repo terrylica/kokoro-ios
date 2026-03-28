@@ -263,18 +263,31 @@ public final class KokoroTTS {
     if let tokenArray {
       TimestampPredictor.preditTimestamps(tokens: tokenArray, predictionDuration: predictedDurations)
     }
-    
+
     // Stop performance timing
     BenchmarkTimer.stopTimer(Constants.bm_TTS)
 
+    // Force synchronous evaluation of the computation graph BEFORE extracting
+    // results. This is critical for memory management: MLX builds a lazy
+    // computation graph during inference, and all intermediate MLXArray values
+    // (durationFeatures, alignedEncoding, f0Prediction, nPrediction, textEncoding,
+    // asrFeatures, etc.) hold references to Metal buffers through the graph.
+    //
+    // Without explicit eval(), calling .asArray() evaluates only the final audio
+    // tensor but leaves intermediate graph nodes alive — their Metal buffers
+    // cannot be freed by Memory.clearCache() because they're still referenced.
+    //
+    // Python MLX (mlx-audio) does this at kokoro.py:161: mx.eval(audio, pred_dur)
+    // which is why Python uses ~0 MB per call while Swift leaked ~2.3 GB per call.
+    eval(audio, predictedDurations)
+
     let result = audio[0].asArray(Float.self)
 
-    // Clear the Metal buffer cache to prevent unbounded IOAccelerator growth.
-    // Each generateAudio() call creates ~1.7 GB of cached Metal buffers that
-    // are never automatically freed. Without this, sequential synthesis (e.g.,
-    // streaming sentence-by-sentence) accumulates tens of GB in swap.
+    // Clear the Metal buffer cache to reclaim GPU memory. Now that eval() has
+    // completed and the computation graph is resolved, cached Metal buffers are
+    // no longer referenced by live MLXArray objects and can actually be freed.
     // This MUST happen inside the dylib to operate on the correct Metal device
-    // singleton -- calling from the host binary clears a separate empty cache.
+    // singleton — calling from the host binary clears a separate empty cache.
     Memory.clearCache()
 
     return (result, tokenArray)
