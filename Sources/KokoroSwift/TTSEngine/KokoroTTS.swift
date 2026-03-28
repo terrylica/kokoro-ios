@@ -187,8 +187,9 @@ public final class KokoroTTS {
     // Set a conservative Metal buffer cache limit to prevent unbounded growth.
     // MLX's default cache limit allows caching up to the recommended working set
     // size (tens of GB on Apple Silicon), which causes severe memory pressure
-    // during sequential synthesis. 32 MB is generous for buffer reuse.
-    Memory.cacheLimit = 32 * 1024 * 1024
+    // during sequential synthesis. 20 MB keeps buffer reuse while limiting
+    // IOAccelerator memory that is never reclaimed within a process lifetime.
+    Memory.cacheLimit = 20 * 1024 * 1024
   }
   
   /// Generates audio from text using the specified voice and parameters.
