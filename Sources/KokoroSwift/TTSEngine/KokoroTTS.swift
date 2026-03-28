@@ -218,74 +218,81 @@ public final class KokoroTTS {
 
     // Step 1: Convert text to phonemes
     let (phonemizedText, tokenArray) = try phonemizeText(text)
-    
-    // Step 2: Tokenize and prepare input
-    let (paddedInputIds, attentionMask, inputLengths, textMask, inputIds) = try prepareInputTensors(phonemizedText)
-    
-    // Step 3: Extract style embeddings from voice
-    let (globalStyle, acousticStyle) = extractStyleEmbeddings(from: voice, tokenCount: inputIds.count)
-    
-    // Step 4: Encode text with BERT and predict duration
-    let durationFeatures = encodeBERTAndDuration(
-      inputIds: paddedInputIds,
-      attentionMask: attentionMask,
-      inputLengths: inputLengths,
-      textMask: textMask,
-      style: globalStyle
-    )
-    
-    // Step 5: Predict phoneme durations
-    let (predictedDurations, alignmentTarget) = predictDurations(
-      features: durationFeatures,
-      batchSize: paddedInputIds.shape[1],
-      speed: speed
-    )
-    
-    // Step 6: Generate aligned encodings
-    let alignedEncoding = durationFeatures.transposed(0, 2, 1).matmul(alignmentTarget)
-    
-    // Step 7: Predict prosody (F0, pitch)
-    let (f0Prediction, nPrediction) = prosodyPredictor.F0NTrain(x: alignedEncoding, s: globalStyle)
-    
-    // Step 8: Encode text for decoder
-    let textEncoding = textEncoder(paddedInputIds, inputLengths: inputLengths, m: textMask)
-    let asrFeatures = MLX.matmul(textEncoding, alignmentTarget)
-    
-    // Step 9: Generate audio
-    let audio = decoder(
-      asr: asrFeatures,
-      F0Curve: f0Prediction,
-      N: nPrediction,
-      s: acousticStyle
-    )[0]
-    
-    // Try to predict timestamp of each token if G2P processor returns tokens
-    if let tokenArray {
-      TimestampPredictor.preditTimestamps(tokens: tokenArray, predictionDuration: predictedDurations)
-    }
+
+    // Run the entire inference pipeline inside a closure scope so all intermediate
+    // MLXArray values (durationFeatures, alignedEncoding, f0Prediction, etc.) are
+    // released by ARC when the closure returns. Without this scoping, Swift keeps
+    // all `let` bindings alive until the end of generateAudio(), and their Metal
+    // buffers cannot be freed by Memory.clearCache().
+    //
+    // Python MLX doesn't have this problem because CPython's reference counting
+    // frees temporaries immediately when they go out of scope within a function.
+    // Swift ARC defers deallocation to scope exit, so we force an inner scope.
+    let result: [Float] = try { () throws -> [Float] in
+      // Step 2: Tokenize and prepare input
+      let (paddedInputIds, attentionMask, inputLengths, textMask, inputIds) = try prepareInputTensors(phonemizedText)
+
+      // Step 3: Extract style embeddings from voice
+      let (globalStyle, acousticStyle) = extractStyleEmbeddings(from: voice, tokenCount: inputIds.count)
+
+      // Step 4: Encode text with BERT and predict duration
+      let durationFeatures = encodeBERTAndDuration(
+        inputIds: paddedInputIds,
+        attentionMask: attentionMask,
+        inputLengths: inputLengths,
+        textMask: textMask,
+        style: globalStyle
+      )
+
+      // Step 5: Predict phoneme durations
+      let (predictedDurations, alignmentTarget) = predictDurations(
+        features: durationFeatures,
+        batchSize: paddedInputIds.shape[1],
+        speed: speed
+      )
+
+      // Step 6: Generate aligned encodings
+      let alignedEncoding = durationFeatures.transposed(0, 2, 1).matmul(alignmentTarget)
+
+      // Step 7: Predict prosody (F0, pitch)
+      let (f0Prediction, nPrediction) = prosodyPredictor.F0NTrain(x: alignedEncoding, s: globalStyle)
+
+      // Step 8: Encode text for decoder
+      let textEncoding = textEncoder(paddedInputIds, inputLengths: inputLengths, m: textMask)
+      let asrFeatures = MLX.matmul(textEncoding, alignmentTarget)
+
+      // Step 9: Generate audio
+      let audio = decoder(
+        asr: asrFeatures,
+        F0Curve: f0Prediction,
+        N: nPrediction,
+        s: acousticStyle
+      )[0]
+
+      // Predict timestamps if G2P processor returns tokens
+      if let tokenArray {
+        TimestampPredictor.preditTimestamps(tokens: tokenArray, predictionDuration: predictedDurations)
+      }
+
+      // Force synchronous evaluation of the full computation graph.
+      // Python MLX does: mx.eval(audio, pred_dur) at kokoro.py:161.
+      // This resolves all lazy computations so Metal buffers backing
+      // intermediate graph nodes can be freed.
+      eval(audio, predictedDurations)
+
+      return audio[0].asArray(Float.self)
+      // All intermediate MLXArrays (paddedInputIds, durationFeatures,
+      // alignedEncoding, f0Prediction, etc.) are released here by ARC
+      // when the closure scope exits.
+    }()
 
     // Stop performance timing
     BenchmarkTimer.stopTimer(Constants.bm_TTS)
 
-    // Force synchronous evaluation of the computation graph BEFORE extracting
-    // results. This is critical for memory management: MLX builds a lazy
-    // computation graph during inference, and all intermediate MLXArray values
-    // (durationFeatures, alignedEncoding, f0Prediction, nPrediction, textEncoding,
-    // asrFeatures, etc.) hold references to Metal buffers through the graph.
-    //
-    // Without explicit eval(), calling .asArray() evaluates only the final audio
-    // tensor but leaves intermediate graph nodes alive — their Metal buffers
-    // cannot be freed by Memory.clearCache() because they're still referenced.
-    //
-    // Python MLX (mlx-audio) does this at kokoro.py:161: mx.eval(audio, pred_dur)
-    // which is why Python uses ~0 MB per call while Swift leaked ~2.3 GB per call.
-    eval(audio, predictedDurations)
-
-    let result = audio[0].asArray(Float.self)
-
-    // Clear the Metal buffer cache to reclaim GPU memory. Now that eval() has
-    // completed and the computation graph is resolved, cached Metal buffers are
-    // no longer referenced by live MLXArray objects and can actually be freed.
+    // Clear the Metal buffer cache. Now that the inference closure has exited,
+    // all intermediate MLXArray values have been deallocated by ARC, and their
+    // Metal buffers are in the cache (not referenced). clearCache() can now
+    // actually reclaim them.
     // This MUST happen inside the dylib to operate on the correct Metal device
     // singleton — calling from the host binary clears a separate empty cache.
     Memory.clearCache()
